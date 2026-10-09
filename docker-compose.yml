@@ -1,0 +1,59 @@
+services:
+  server:
+    build: .
+    user: "${SERVER_UID:-1000}:${SERVER_GID:-1000}"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${STORAGE_DIR:-./storage}:/storage
+      - ${KEYS_DIR:-./keys}:/keys:ro
+    env_file: [ .env ]
+    environment:
+      - DATA_DIR=/data
+      - STORAGE_DIR=/storage
+      - PORT=${PORT:-8000}
+      - SYNCME_KEYS_FILE=/keys/keys.toml
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:\" + str(__import__(\"os\").environ.get(\"PORT\", 8000)) + \"/health\").read()'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  keys:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "app.keys"]
+    user: "${KEYS_UID:-1000}:${KEYS_GID:-1000}"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${KEYS_DIR:-./keys}:/keys
+    environment:
+      - SYNCME_KEYS_FILE=/keys/keys.toml
+
+  cli:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "app.cli"]
+    user: "${KEYS_UID:-1000}:${KEYS_GID:-1000}"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${KEYS_DIR:-./keys}:/keys:ro
+      - ${DATA_DIR:-./data}:/data
+      - ${STORAGE_DIR:-./storage}:/storage:ro
+    environment:
+      - DATA_DIR=/data
+      - STORAGE_DIR=/storage
+      - SYNCME_KEYS_FILE=/keys/keys.toml
+

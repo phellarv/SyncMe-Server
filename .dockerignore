@@ -1,0 +1,13 @@
+keys/
+.env
+.env.*
+!.env.example
+.venv/
+data/
+storage/
+.git/
+tests/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+test_data/
