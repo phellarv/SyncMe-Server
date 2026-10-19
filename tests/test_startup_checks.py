@@ -133,3 +133,27 @@ async def test_startup_sweeps_before_indexing(dirs, monkeypatch):
     assert young.exists()
 
 
+def test_indexing_large_file_streams_without_read_bytes(dirs, monkeypatch):
+    import hashlib
+    import pathlib
+    ws = dirs / "storage" / "workspaces" / "ws1"
+    ws.mkdir(parents=True, exist_ok=True)
+    large_file = ws / "large.bin"
+    content = b"A" * (65536 + 1024)
+    large_file.write_bytes(content)
+
+    read_bytes_called = []
+    real_read_bytes = pathlib.Path.read_bytes
+
+    def spy_read_bytes(self):
+        read_bytes_called.append(self)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", spy_read_bytes)
+    assert db.index_existing_files(storage.get_files_dir()) == 1
+    # read_bytes must NOT have been called for large.bin
+    assert large_file not in read_bytes_called
+
+    row = db.get_file("ws1", "large.bin")
+    assert row is not None
+    assert row["sha256"] == hashlib.sha256(content).hexdigest()

@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from fastapi import HTTPException, status
 
@@ -12,6 +13,7 @@ MAX_PATH_BYTES = 3500
 RESERVED_PREFIX = ".syncme-upload-"
 
 _IF_MATCH_RE = re.compile(r'"([0-9]{1,18})"|W/"([0-9]{1,18})"|([0-9]{1,18})')   # ASCII digits only
+_CONFLICT_ARTIFACT_RE = re.compile(r".+\.conflict\.[0-9]+(?:_[0-9]+)?(?:\.[^/]+)?$")
 
 
 def _bad(detail: str) -> HTTPException:
@@ -43,6 +45,7 @@ def normalize_path(path: str, slack: int = 0) -> str:
     """Normalize a client-supplied relative path; `slack` widens the length limits (archive names only)."""
     if not path or "\x00" in path or "\\" in path or path.startswith("/"):
         raise _bad("Invalid path")
+    path = unicodedata.normalize("NFC", path)
     parts = [p for p in path.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise _bad("Invalid path")
@@ -54,6 +57,8 @@ def normalize_path(path: str, slack: int = 0) -> str:
         raise _bad("Path too long")
     if any(p.startswith(RESERVED_PREFIX) for p in parts):
         raise _bad("Invalid path")
+    if slack == 0 and _CONFLICT_ARTIFACT_RE.fullmatch(parts[-1]):
+        raise _bad("Invalid path: conflict artifact")
     return "/".join(parts)
 
 

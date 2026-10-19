@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import os
 import shutil
@@ -453,3 +454,18 @@ async def test_a_content_length_of_non_ascii_digits_is_ignored_not_a_500(raw_asg
     )
     assert status == 200
     assert db.get_file("ws1", "a.txt")["size"] == 5
+
+
+@pytest.mark.asyncio
+async def test_upload_persists_in_thread(client, monkeypatch):
+    called_in_thread = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func, *args, **kwargs):
+        called_in_thread.append(getattr(func, "__name__", str(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spy_to_thread)
+    r = await client.put(UP + "async_test.txt", content=b"async data", headers=H)
+    assert r.status_code == 200
+    assert "_persist_upload" in called_in_thread

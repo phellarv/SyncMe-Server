@@ -13,7 +13,6 @@ dependencies = [
     "sse-starlette",
     "pydantic",
     "pydantic-settings",
-    "httpx",
 ]
 
 [project.optional-dependencies]

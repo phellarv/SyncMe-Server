@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     MAX_UPLOAD_BYTES: int = 256 * 1024 * 1024
+    TRUST_PROXY_HEADERS: bool = False
 
     model_config = SettingsConfigDict(
         env_file=(PROJECT_ROOT / ".env", ".env"),

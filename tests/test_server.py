@@ -155,3 +155,31 @@ async def test_index_existing_files(client):
     assert response.status_code == 200
     data = response.json()
     assert any(f["path"] == "pre_existing.txt" for f in data["files"])
+
+
+@pytest.mark.asyncio
+async def test_restore_history_response_includes_sha256(client):
+    import hashlib
+    content1 = b"version one"
+    content2 = b"version two"
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef0123456789abcdef"}
+
+    r1 = await client.put("/api/v1/workspaces/ws1/files/doc.txt", content=content1, headers=headers)
+    assert r1.status_code == 200
+    rev1 = r1.json()["revision"]
+
+    r2 = await client.put("/api/v1/workspaces/ws1/files/doc.txt", content=content2, headers=headers)
+    assert r2.status_code == 200
+
+    restore_resp = await client.post(
+        "/api/v1/workspaces/ws1/history/doc.txt/restore",
+        json={"restore_revision": rev1},
+        headers=headers,
+    )
+    assert restore_resp.status_code == 200
+    data = restore_resp.json()
+    expected_sha256 = hashlib.sha256(content1).hexdigest()
+    assert data["path"] == "doc.txt"
+    assert data["revision"] == data["new_revision"]
+    assert data["sha256"] == expected_sha256
+

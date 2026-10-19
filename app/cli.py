@@ -79,7 +79,12 @@ def load_all_clients() -> tuple[dict[str, dict], list[dict]]:
 def is_client_active(name: str) -> bool:
     try:
         from . import events
-        return events.broadcaster.count_for(name) > 0
+        if events.broadcaster.count_for(name) > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return db.is_client_sse_active(name)
     except Exception:
         return False
 
@@ -224,6 +229,23 @@ def cmd_client_status(client_name: str) -> int:
     return 0
 
 
+def cmd_prune(keep_versions: int = 10, archive_days: float | None = None) -> int:
+    if keep_versions < 1:
+        print("error: --keep-versions must be at least 1", file=sys.stderr)
+        return 1
+    if archive_days is not None and archive_days < 0:
+        print("error: --archive-days must be non-negative", file=sys.stderr)
+        return 1
+    from . import storage
+    try:
+        stats = storage.prune_storage(keep_versions=keep_versions, archive_days=archive_days)
+    except OSError as e:
+        print(f"error: failed to prune storage: {e}", file=sys.stderr)
+        return 1
+    print(f"Pruned {stats['versions_deleted']} old version record(s), {stats['cas_deleted']} unreferenced CAS object(s), {stats['archive_deleted']} archive file(s).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description="SyncMe Server Management CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -236,6 +258,10 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = client_sub.add_parser("status", help="Show sync state and recent activity for a client")
     status_parser.add_argument("name", help="Name of client")
 
+    prune_parser = sub.add_parser("prune", help="Prune old file versions, unreferenced CAS objects, and expired archives")
+    prune_parser.add_argument("--keep-versions", type=int, default=10, help="Number of file versions to keep per file (default: 10)")
+    prune_parser.add_argument("--archive-days", type=float, default=None, help="Delete archive files older than N days")
+
     args = parser.parse_args(argv)
     if args.cmd == "clients":
         return cmd_clients()
@@ -244,8 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "client":
         if args.client_cmd == "status":
             return cmd_client_status(args.name)
+    elif args.cmd == "prune":
+        return cmd_prune(keep_versions=args.keep_versions, archive_days=args.archive_days)
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

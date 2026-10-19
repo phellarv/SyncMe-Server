@@ -21,6 +21,7 @@ def setup_db(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_DIR", data_dir)
     monkeypatch.setattr(settings, "DB_PATH", data_dir / "server_state.db")
     monkeypatch.setattr(settings, "STORAGE_DIR", tmp_path / "storage")
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", True)
 
     if hasattr(db._local, "conn"):
         del db._local.conn
@@ -192,3 +193,35 @@ async def test_server_activity_recording_in_main():
         state = db.get_client_state("client1")
         assert state[0]["last_synced_revision"] == 2
         assert state[0]["last_ip"] == "1.2.3.9"
+
+
+def test_sse_connections_tracking():
+    assert db.is_client_sse_active("client1") is False
+    db.register_sse_connection("conn-1", "client1", "ws1")
+    assert db.is_client_sse_active("client1") is True
+    assert db.is_client_sse_active("client2") is False
+
+    db.touch_sse_connection("conn-1")
+    assert db.is_client_sse_active("client1") is True
+
+    db.unregister_sse_connection("conn-1")
+    assert db.is_client_sse_active("client1") is False
+
+
+def test_prune_stale_sse_connections():
+    conn = db.get_conn()
+    old_time = time.time() - 120
+    fresh_time = time.time()
+    with conn:
+        conn.execute(
+            "INSERT INTO sse_connections (conn_id, client_name, workspace_id, last_seen) VALUES (?, ?, ?, ?)",
+            ("stale-conn", "client1", "ws1", old_time),
+        )
+        conn.execute(
+            "INSERT INTO sse_connections (conn_id, client_name, workspace_id, last_seen) VALUES (?, ?, ?, ?)",
+            ("fresh-conn", "client2", "ws1", fresh_time),
+        )
+    assert db.is_client_sse_active("client1", ttl=60) is False
+    assert db.is_client_sse_active("client2", ttl=60) is True
+    assert db.prune_stale_sse_connections(max_age=60) == 1
+    assert db.is_client_sse_active("client2", ttl=60) is True

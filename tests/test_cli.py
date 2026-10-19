@@ -108,6 +108,37 @@ def test_cli_clients_active_sse(capsys):
     assert "Online (SSE)" in lines[0]
 
 
+def test_cli_clients_active_sse_from_db_without_broadcaster(capsys):
+    now = time.time()
+    # Broadcaster is empty (separate process simulation)
+    events.broadcaster.workspaces.clear()
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO client_state (client_name, workspace_id, last_seen, last_synced_revision, last_ip) VALUES (?, ?, ?, ?, ?)",
+        ("workstation", "ws1", now - 600, 3, "192.168.1.60")
+    )
+
+    # Active connection recorded in DB
+    db.register_sse_connection("conn-123", "workstation", "ws1")
+
+    ret = main(["clients"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if "workstation" in l]
+    assert len(lines) == 1
+    assert "Online (SSE)" in lines[0]
+
+    # After unregister, should fall back to Idle
+    db.unregister_sse_connection("conn-123")
+    ret = main(["clients"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if "workstation" in l]
+    assert len(lines) == 1
+    assert "Idle (10m ago)" in lines[0]
+
+
+
 def test_cli_status_all_synced(capsys):
     db.upsert_file("ws1", "hello.txt", "h1", 1024, time.time(), client_name="laptop")
     db.record_client_activity("laptop", "ws1", revision=1, ip="192.168.1.50")
@@ -196,3 +227,45 @@ def test_docker_compose_cli_service():
     assert "${KEYS_DIR:-./keys}:/keys:ro" in cli_svc["volumes"]
     assert "${DATA_DIR:-./data}:/data" in cli_svc["volumes"]
     assert "${STORAGE_DIR:-./storage}:/storage:ro" in cli_svc["volumes"]
+
+
+def test_cli_prune_command(capsys, tmp_path):
+    import hashlib
+    from app import storage
+
+    ws_id = "ws1"
+    for i in range(4):
+        content = f"v{i}".encode()
+        h = hashlib.sha256(content).hexdigest()
+        src = tmp_path / f"v{i}.txt"
+        src.write_bytes(content)
+        storage.store_cas_object(ws_id, src, h)
+        db.upsert_file(ws_id, "file.txt", h, len(content), time.time(), client_name="laptop")
+
+    ret = main(["prune", "--keep-versions", "2", "--archive-days", "7"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "2" in out
+    assert len(db.get_file_history(ws_id, "file.txt")) == 2
+
+
+def test_cli_prune_validation_errors(capsys):
+    ret = main(["prune", "--keep-versions", "0"])
+    assert ret == 1
+    assert "keep-versions" in capsys.readouterr().err
+
+    ret = main(["prune", "--archive-days", "-1"])
+    assert ret == 1
+    assert "archive-days" in capsys.readouterr().err
+
+
+def test_cli_prune_storage_oserror(capsys, monkeypatch):
+    from app import storage
+    def mock_prune(*args, **kwargs):
+        raise PermissionError("Read-only file system")
+    monkeypatch.setattr(storage, "prune_storage", mock_prune)
+    ret = main(["prune"])
+    assert ret == 1
+    assert "Read-only file system" in capsys.readouterr().err
+
+

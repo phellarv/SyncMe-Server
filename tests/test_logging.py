@@ -223,3 +223,16 @@ def test_access_log_is_redacted_when_uvicorn_loads_log_config_json():
         _assert_redacted_but_logged(_access_output_through_the_configured_handler())
     finally:
         configure_logging()
+
+
+def test_load_logging_config_loads_from_central_file():
+    from app.logging_config import DEFAULT_DATE_FORMAT, load_logging_config, LOG_CONFIG_PATH
+    config = load_logging_config()
+    assert isinstance(config, dict)
+    assert config["version"] == 1
+    assert "formatters" in config
+    assert "handlers" in config
+    assert "loggers" in config
+    assert config["handlers"]["access"]["filters"] == ["redact_query_tokens"]
+    assert config["formatters"]["default"]["datefmt"] == DEFAULT_DATE_FORMAT
+    assert LOG_CONFIG_PATH.is_file()

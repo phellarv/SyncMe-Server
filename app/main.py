@@ -3,9 +3,9 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import Annotated
+from typing import Annotated, TypeVar
 from fastapi.exceptions import RequestValidationError
-from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Header, Query
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sse_starlette.sse import EventSourceResponse
@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
     configure_logging()
     keystore.load()   # fail closed: a missing or invalid key file stops the server
     storage.sweep_stale_temp_files()   # orphans of a crashed upload; before indexing, which skips them anyway
+    db.prune_stale_sse_connections()
     # Startup: index existing files in storage dir in background so server starts immediately
     index_task = asyncio.create_task(asyncio.to_thread(db.index_existing_files, storage.get_files_dir()))
     def _on_index_done(t):
@@ -75,8 +76,6 @@ def get_state(
     db.record_client_activity(client_name, workspace_id, revision=since_revision, ip=auth._source_ip(request))
     return {"files": files, "latest_revision": latest_revision, "last_revision": latest_revision}
 
-get_files = get_state
-
 @app.get("/api/v1/workspaces/{workspace_id}/files/{path:path}", dependencies=[Depends(auth.verify_token), Depends(valid_workspace)])
 def get_file(workspace_id: str, path: str):
     path = normalize_path(path)
@@ -99,6 +98,7 @@ async def put_file(
     request: Request,
     client_name: Annotated[str, Depends(auth.verify_token)],
     if_match: Annotated[str | None, Header()] = None,
+    x_client_id: Annotated[str | None, Header()] = None,
 ):
     path = normalize_path(path)
     expected_revision = parse_if_match(if_match)
@@ -122,6 +122,7 @@ async def put_file(
     tmp_name = tmp.name
 
     def commit_file():
+        storage.store_cas_object(workspace_id, tmp_name, sha256_hex)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp_name, file_path)
 
@@ -137,12 +138,14 @@ async def put_file(
             os.fsync(tmp.fileno())          # the data is on disk before the rename makes it the file
             
         sha256_hex = digest.hexdigest()
-        storage.store_cas_object(workspace_id, tmp_name, sha256_hex)
-        
-        new_rev = db.upsert_file(
-            workspace_id, path, sha256_hex, size, time.time(), expected_revision,
-            before_commit=commit_file, client_name=client_name
-        )
+
+        def _persist_upload() -> int:
+            return db.upsert_file(
+                workspace_id, path, sha256_hex, size, time.time(), expected_revision,
+                before_commit=commit_file, client_name=client_name
+            )
+
+        new_rev = await asyncio.shield(asyncio.to_thread(_persist_upload))
     except (IsADirectoryError, NotADirectoryError, FileExistsError):
         raise HTTPException(status_code=409, detail="Path conflicts with an existing file or directory")
     finally:
@@ -151,11 +154,9 @@ async def put_file(
         except FileNotFoundError:
             pass
 
-    await events.broadcaster.broadcast(workspace_id, "file_updated", path, new_rev, client_name)
-    db.record_client_activity(client_name, workspace_id, revision=new_rev, ip=auth._source_ip(request))
+    await events.broadcaster.broadcast(workspace_id, "file_updated", path, new_rev, client_name, origin_instance_id=x_client_id)
+    await asyncio.to_thread(db.record_client_activity, client_name, workspace_id, revision=new_rev, ip=auth._source_ip(request))
     return {"revision": new_rev}
-
-upload_file = put_file
 
 @app.delete("/api/v1/workspaces/{workspace_id}/files/{path:path}", dependencies=[Depends(auth.verify_token), Depends(valid_workspace)])
 async def delete_file(
@@ -164,13 +165,14 @@ async def delete_file(
     request: Request,
     client_name: Annotated[str, Depends(auth.verify_token)],
     if_match: Annotated[str | None, Header()] = None,
+    x_client_id: Annotated[str | None, Header()] = None,
 ):
     path = normalize_path(path)
     expected_revision = parse_if_match(if_match)
     
-    new_rev = db.delete_file(workspace_id, path, expected_revision, client_name=client_name)
-    await events.broadcaster.broadcast(workspace_id, "file_deleted", path, new_rev, client_name)
-    db.record_client_activity(client_name, workspace_id, revision=new_rev, ip=auth._source_ip(request))
+    new_rev = await asyncio.to_thread(db.delete_file, workspace_id, path, expected_revision, client_name=client_name)
+    await events.broadcaster.broadcast(workspace_id, "file_deleted", path, new_rev, client_name, origin_instance_id=x_client_id)
+    await asyncio.to_thread(db.record_client_activity, client_name, workspace_id, revision=new_rev, ip=auth._source_ip(request))
     
     return {"revision": new_rev}
 
@@ -180,16 +182,20 @@ async def sse_events(
     request: Request,
     client_name: Annotated[str, Depends(auth.verify_token)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(auth.security)],
+    x_client_id: Annotated[str | None, Header()] = None,
 ):
-    db.record_client_activity(client_name, workspace_id, ip=auth._source_ip(request))
+    await asyncio.to_thread(db.record_client_activity, client_name, workspace_id, ip=auth._source_ip(request))
     token = credentials.credentials if credentials else ""
     client_id = str(uuid.uuid4())
+    conn_id = str(uuid.uuid4())
     try:
-        queue = events.broadcaster.subscribe(workspace_id, client_id, owner=client_name)
+        queue = events.broadcaster.subscribe(workspace_id, client_id, owner=client_name, instance_id=x_client_id)
     except events.TooManySubscribers:
         raise HTTPException(status_code=429, detail="Too many event streams for this client")
+    await asyncio.to_thread(db.register_sse_connection, conn_id, client_name, workspace_id)
     
     async def event_generator():
+        last_touch = time.time()
         try:
             while True:
                 if queue.dropped:
@@ -204,8 +210,12 @@ async def sse_events(
                 # so that a revoked or rotated key does not keep a stream open.
                 if await asyncio.to_thread(keystore.authenticate, token) != client_name:
                     return
+                now = time.time()
+                if now - last_touch >= SSE_REVALIDATE_INTERVAL:
+                    last_touch = now
+                    await asyncio.to_thread(db.touch_sse_connection, conn_id)
                 if msg is None:
-                    db.record_client_activity(client_name, workspace_id, ip=auth._source_ip(request))
+                    await asyncio.to_thread(db.record_client_activity, client_name, workspace_id, ip=auth._source_ip(request))
                     yield {"comment": "keepalive"}
                     continue
                 import json
@@ -215,6 +225,7 @@ async def sse_events(
                 }
         finally:
             events.broadcaster.unsubscribe(workspace_id, client_id)
+            await asyncio.to_thread(db.unregister_sse_connection, conn_id)
             
     return EventSourceResponse(event_generator())
 
@@ -231,8 +242,9 @@ class RestoreRequest(BaseModel):
 # A restore request is a few hundred bytes of JSON; anything larger is refused.
 RESTORE_MAX_BODY_BYTES = 64 * 1024
 
-@app.post("/api/v1/workspaces/{workspace_id}/archive/restore", dependencies=[Depends(auth.verify_token), Depends(valid_workspace)])
-async def restore_archive(workspace_id: str, request: Request, client_name: Annotated[str, Depends(auth.verify_token)]):
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+async def _read_bounded_json(request: Request, model_cls: type[_ModelT]) -> _ModelT:
     # The body is NOT a declared parameter: FastAPI would read and validate it before it runs the
     # authentication dependencies, so an unauthenticated caller could make the server buffer any amount of
     # data. Here the key has already been checked; only now is the body read, and only up to the cap.
@@ -245,16 +257,28 @@ async def restore_archive(workspace_id: str, request: Request, client_name: Anno
         if len(body) > RESTORE_MAX_BODY_BYTES:
             raise HTTPException(status_code=413, detail="Request body too large")
     try:
-        req = RestoreRequest.model_validate_json(bytes(body))
+        return model_cls.model_validate_json(bytes(body))
     except ValidationError as e:
         # the same 422 body FastAPI produces for a declared body parameter
         raise RequestValidationError(
             [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False, include_context=False, include_input=False)]
         ) from None
+
+@app.post("/api/v1/workspaces/{workspace_id}/archive/restore", dependencies=[Depends(auth.verify_token), Depends(valid_workspace)])
+async def restore_archive(
+    workspace_id: str,
+    request: Request,
+    client_name: Annotated[str, Depends(auth.verify_token)],
+    x_client_id: Annotated[str | None, Header()] = None,
+):
+    req = await _read_bounded_json(request, RestoreRequest)
     req.target_path = normalize_path(req.target_path)
     try:
-        new_rev = storage.restore_file(workspace_id, req.archive_filename, req.target_path, req.expected_revision)
-        await events.broadcaster.broadcast(workspace_id, "file_updated", req.target_path, new_rev, client_name)
+        new_rev = await asyncio.to_thread(
+            storage.restore_file, workspace_id, req.archive_filename, req.target_path, req.expected_revision,
+            client_name=client_name,
+        )
+        await events.broadcaster.broadcast(workspace_id, "file_updated", req.target_path, new_rev, client_name, origin_instance_id=x_client_id)
         return {"revision": new_rev}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Archive file not found")
@@ -284,21 +308,14 @@ class RestoreHistoryRequest(BaseModel):
     client_id: str | None = None
 
 @app.post("/api/v1/workspaces/{workspace_id}/history/{path:path}/restore", dependencies=[Depends(auth.verify_token), Depends(valid_workspace)])
-async def restore_history(workspace_id: str, path: str, request: Request, client_name: Annotated[str, Depends(auth.verify_token)]):
-    declared = _declared_length(request)
-    if declared is not None and declared > RESTORE_MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Request body too large")
-    body = bytearray()
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > RESTORE_MAX_BODY_BYTES:
-            raise HTTPException(status_code=413, detail="Request body too large")
-    try:
-        req = RestoreHistoryRequest.model_validate_json(bytes(body))
-    except ValidationError as e:
-        raise RequestValidationError(
-            [{**err, "loc": ("body", *err["loc"])} for err in e.errors(include_url=False, include_context=False, include_input=False)]
-        ) from None
+async def restore_history(
+    workspace_id: str,
+    path: str,
+    request: Request,
+    client_name: Annotated[str, Depends(auth.verify_token)],
+    x_client_id: Annotated[str | None, Header()] = None,
+):
+    req = await _read_bounded_json(request, RestoreHistoryRequest)
     
     rev_to_restore = req.restore_revision if req.restore_revision is not None else req.revision
     if rev_to_restore is None:
@@ -306,9 +323,13 @@ async def restore_history(workspace_id: str, path: str, request: Request, client
         
     path = normalize_path(path)
     try:
-        new_rev = storage.restore_cas_file(workspace_id, path, rev_to_restore, req.expected_revision, client_name=client_name)
-        await events.broadcaster.broadcast(workspace_id, "file_updated", path, new_rev, client_name)
-        return {"path": path, "revision": new_rev, "new_revision": new_rev}
+        new_rev = await asyncio.to_thread(
+            storage.restore_cas_file, workspace_id, path, rev_to_restore, req.expected_revision, client_name=client_name
+        )
+        ver = await asyncio.to_thread(db.get_file_version, workspace_id, path, new_rev)
+        sha256 = ver["sha256"] if ver else None
+        await events.broadcaster.broadcast(workspace_id, "file_updated", path, new_rev, client_name, origin_instance_id=x_client_id)
+        return {"path": path, "revision": new_rev, "new_revision": new_rev, "sha256": sha256}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Revision not found")
 
@@ -316,3 +337,4 @@ async def restore_history(workspace_id: str, path: str, request: Request, client
 def get_history(workspace_id: str, path: str, limit: Annotated[int, Query(ge=1, le=1000)] = 50):
     path = normalize_path(path)
     return {"path": path, "history": db.get_file_history(workspace_id, path, limit=limit)}
+

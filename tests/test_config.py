@@ -14,6 +14,7 @@ ENV_VARS_TO_CLEAR = [
     "DB_PATH",
     "HOST",
     "PORT",
+    "TRUST_PROXY_HEADERS",
 ]
 
 
@@ -30,7 +31,8 @@ def test_settings_loads_values_from_env_file(tmp_path):
         "SYNCME_API_KEY=test-secret-key-456\n"
         "PORT=9090\n"
         "DATA_DIR=/tmp/custom_data\n"
-        "HOST=127.0.0.1\n",
+        "HOST=127.0.0.1\n"
+        "TRUST_PROXY_HEADERS=true\n",
         encoding="utf-8",
     )
 
@@ -39,6 +41,7 @@ def test_settings_loads_values_from_env_file(tmp_path):
     assert settings.PORT == 9090
     assert settings.DATA_DIR == Path("/tmp/custom_data")
     assert settings.HOST == "127.0.0.1"
+    assert settings.TRUST_PROXY_HEADERS is True
 
 
 def test_settings_ignores_extra_unknown_keys(tmp_path):
@@ -90,6 +93,7 @@ def test_settings_default_values():
     assert settings.HOST == "0.0.0.0"
     assert settings.PORT == 8000
     assert settings.DATA_DIR == Path("./data")
+    assert settings.TRUST_PROXY_HEADERS is False
 
 
 def test_settings_and_storage_dir_from_env(tmp_path):

@@ -71,6 +71,18 @@ def init_db(conn: sqlite3.Connection):
                 PRIMARY KEY (client_name, workspace_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sse_connections (
+                conn_id TEXT PRIMARY KEY,
+                client_name TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                last_seen REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sse_connections_client_seen
+            ON sse_connections (client_name, last_seen)
+        """)
 
 def get_revision(workspace_id: str) -> int:
     conn = get_conn()
@@ -117,15 +129,30 @@ def upsert_file(workspace_id: str, path: str, sha256: str, size: int, mtime: flo
     with conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            cursor = conn.execute("SELECT revision FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, path))
+            cursor = conn.execute("SELECT revision, is_deleted, sha256 FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, path))
             row = cursor.fetchone()
-            current_revision = row[0] if row else None
-            
-            if expected_revision is not None:
-                if current_revision is None and expected_revision != 0:
-                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File does not exist")
-                if current_revision is not None and expected_revision != current_revision:
-                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Revision mismatch")
+            is_deleted = bool(row["is_deleted"]) if row else False
+            effective_revision = 0 if (row is None or is_deleted) else row["revision"]
+
+            if expected_revision is not None and expected_revision != effective_revision:
+                if row is not None and not is_deleted and expected_revision < effective_revision and row["sha256"] == sha256:
+                    from . import storage
+                    if before_commit is not None and not storage.get_file_path(workspace_id, path).exists():
+                        before_commit()
+                    return row["revision"]
+
+                reason = "deleted" if is_deleted else ("missing" if row is None else "revision_mismatch")
+                detail = "File does not exist" if effective_revision == 0 else "Revision mismatch"
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=detail,
+                    headers={
+                        "X-SyncMe-Conflict-Reason": reason,
+                        "X-SyncMe-Current-Revision": str(effective_revision),
+                        "X-SyncMe-Head-Revision": str(row["revision"] if row else 0),
+                        "X-SyncMe-Current-SHA256": (row["sha256"] or "") if (row and not is_deleted) else "",
+                    },
+                )
             
             new_rev = _increment_revision(conn, workspace_id)
             
@@ -159,17 +186,23 @@ def delete_file(workspace_id: str, path: str, expected_revision: int | None = No
     with conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            cursor = conn.execute("SELECT revision, is_deleted FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, path))
+            cursor = conn.execute("SELECT revision, is_deleted, sha256 FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, path))
             row = cursor.fetchone()
             if not row or row[1]:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
             current_revision = row[0]
             
             if expected_revision is not None and expected_revision != current_revision:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Revision mismatch")
-            
-            from . import storage
-            storage.archive_file(workspace_id, path)
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Revision mismatch",
+                    headers={
+                        "X-SyncMe-Conflict-Reason": "revision_mismatch",
+                        "X-SyncMe-Current-Revision": str(current_revision),
+                        "X-SyncMe-Head-Revision": str(current_revision),
+                        "X-SyncMe-Current-SHA256": row["sha256"] or "",
+                    },
+                )
             
             new_rev = _increment_revision(conn, workspace_id)
             
@@ -183,6 +216,9 @@ def delete_file(workspace_id: str, path: str, expected_revision: int | None = No
                 INSERT INTO file_versions (workspace_id, path, revision, sha256, size, mtime, client_name, created_at, is_deleted)
                 VALUES (?, ?, ?, NULL, 0, ?, ?, ?, 1)
             """, (workspace_id, path, new_rev, time.time(), client_name, time.time()))
+            
+            from . import storage
+            storage.archive_file(workspace_id, path)
             
             return new_rev
         except Exception:
@@ -241,6 +277,69 @@ def get_client_state(client_name: str) -> list[dict]:
     cursor = conn.execute("SELECT * FROM client_state WHERE client_name = ? ORDER BY workspace_id", (client_name,))
     return [dict(row) for row in cursor.fetchall()]
 
+
+def register_sse_connection(conn_id: str, client_name: str, workspace_id: str) -> None:
+    try:
+        conn = get_conn()
+        now = time.time()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sse_connections (conn_id, client_name, workspace_id, last_seen) VALUES (?, ?, ?, ?)",
+                (conn_id, client_name, workspace_id, now),
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger("syncme.db").warning("register_sse_connection failed: %s", e)
+
+
+def touch_sse_connection(conn_id: str) -> None:
+    try:
+        conn = get_conn()
+        now = time.time()
+        with conn:
+            conn.execute(
+                "UPDATE sse_connections SET last_seen = ? WHERE conn_id = ?",
+                (now, conn_id),
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger("syncme.db").warning("touch_sse_connection failed: %s", e)
+
+
+def unregister_sse_connection(conn_id: str) -> None:
+    try:
+        conn = get_conn()
+        with conn:
+            conn.execute("DELETE FROM sse_connections WHERE conn_id = ?", (conn_id,))
+    except Exception as e:
+        import logging
+        logging.getLogger("syncme.db").warning("unregister_sse_connection failed: %s", e)
+
+
+def is_client_sse_active(client_name: str, ttl: float = 60.0) -> bool:
+    try:
+        conn = get_conn()
+        cutoff = time.time() - ttl
+        cursor = conn.execute(
+            "SELECT 1 FROM sse_connections WHERE client_name = ? AND last_seen > ? LIMIT 1",
+            (client_name, cutoff),
+        )
+        return cursor.fetchone() is not None
+    except Exception:
+        return False
+
+
+def prune_stale_sse_connections(max_age: float = 60.0) -> int:
+    try:
+        conn = get_conn()
+        cutoff = time.time() - max_age
+        with conn:
+            cur = conn.execute("DELETE FROM sse_connections WHERE last_seen < ?", (cutoff,))
+            return cur.rowcount
+    except Exception:
+        return 0
+
+
 def get_workspaces_summary() -> list[dict]:
     conn = get_conn()
     cursor = conn.execute("""
@@ -256,36 +355,45 @@ def get_workspaces_summary() -> list[dict]:
         ORDER BY workspace_id
     """)
     ws_ids = [row[0] for row in cursor.fetchall()]
+    if not ws_ids:
+        return []
+
+    rev_map: dict[str, int] = {}
+    for row in conn.execute("SELECT substr(key, 18) AS workspace_id, CAST(value AS INTEGER) AS rev FROM metadata WHERE key LIKE 'current_revision:%'"):
+        rev_map[row["workspace_id"]] = row["rev"]
+
+    files_map: dict[str, tuple[int, int, float]] = {}
+    for row in conn.execute("""
+        SELECT workspace_id, COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS total_size, COALESCE(MAX(mtime), 0.0) AS max_mtime
+        FROM files
+        WHERE is_deleted = 0
+        GROUP BY workspace_id
+    """):
+        files_map[row["workspace_id"]] = (row["cnt"], row["total_size"], float(row["max_mtime"]))
+
+    versions_map: dict[str, tuple[str | None, float, int]] = {}
+    for row in conn.execute("""
+        SELECT workspace_id, client_name, created_at, revision
+        FROM (
+            SELECT workspace_id, client_name, created_at, revision,
+                   ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY revision DESC, created_at DESC) AS rn
+            FROM file_versions
+        )
+        WHERE rn = 1
+    """):
+        versions_map[row["workspace_id"]] = (row["client_name"], float(row["created_at"]), int(row["revision"]))
+
     summaries = []
     for ws_id in ws_ids:
-        cur_rev = get_revision(ws_id)
-        
-        f_cur = conn.execute("""
-            SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(MAX(mtime), 0.0)
-            FROM files
-            WHERE workspace_id = ? AND is_deleted = 0
-        """, (ws_id,))
-        f_row = f_cur.fetchone()
-        file_count = f_row[0]
-        total_size = f_row[1]
-        max_mtime = float(f_row[2])
-        
-        v_cur = conn.execute("""
-            SELECT client_name, created_at, revision
-            FROM file_versions
-            WHERE workspace_id = ?
-            ORDER BY revision DESC, created_at DESC
-            LIMIT 1
-        """, (ws_id,))
-        v_row = v_cur.fetchone()
-        last_client = v_row["client_name"] if v_row else None
-        last_v_created = float(v_row["created_at"]) if v_row else 0.0
-        
-        if v_row and v_row["revision"] > cur_rev:
-            cur_rev = v_row["revision"]
-            
+        cur_rev = rev_map.get(ws_id, 0)
+        file_count, total_size, max_mtime = files_map.get(ws_id, (0, 0, 0.0))
+        last_client, last_v_created, max_v_rev = versions_map.get(ws_id, (None, 0.0, 0))
+
+        if max_v_rev > cur_rev:
+            cur_rev = max_v_rev
+
         last_modified = max(max_mtime, last_v_created)
-        
+
         summaries.append({
             "workspace_id": ws_id,
             "current_revision": cur_rev,
@@ -295,6 +403,51 @@ def get_workspaces_summary() -> list[dict]:
             "last_client": last_client,
         })
     return summaries
+
+
+def prune_old_versions(keep_versions: int = 10) -> int:
+    if keep_versions < 1:
+        raise ValueError("keep_versions must be >= 1")
+    conn = get_conn()
+    with conn:
+        cur = conn.execute("""
+            DELETE FROM file_versions
+            WHERE (workspace_id, path, revision) IN (
+                SELECT workspace_id, path, revision
+                FROM (
+                    SELECT workspace_id, path, revision, is_deleted,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY workspace_id, path, is_deleted
+                               ORDER BY revision DESC
+                           ) AS rn_by_type,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY workspace_id, path
+                               ORDER BY revision DESC
+                           ) AS rn_all
+                    FROM file_versions
+                )
+                WHERE rn_all > ?
+                  AND NOT (is_deleted = 0 AND rn_by_type <= ?)
+            )
+            AND (workspace_id, path, revision) NOT IN (
+                SELECT workspace_id, path, revision FROM files
+            )
+        """, (keep_versions, keep_versions))
+        return cur.rowcount
+
+
+def get_referenced_cas_hashes() -> set[tuple[str, str]]:
+    conn = get_conn()
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute("""
+            SELECT workspace_id, sha256 FROM files WHERE sha256 IS NOT NULL AND sha256 != '' AND is_deleted = 0
+            UNION
+            SELECT workspace_id, sha256 FROM file_versions WHERE sha256 IS NOT NULL AND sha256 != ''
+        """)
+        return {(row[0], row[1]) for row in cursor.fetchall()}
+
 
 def get_client_recent_files(client_name: str, limit: int = 10) -> list[dict]:
     conn = get_conn()
@@ -388,6 +541,8 @@ def index_existing_files(files_dir: Path) -> int:
             with conn:
                 cursor = conn.execute("SELECT sha256, is_deleted, revision, mtime, size FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, rel_path))
                 row = cursor.fetchone()
+                pre_rev = row['revision'] if row is not None else None
+                pre_deleted = bool(row['is_deleted']) if row is not None else None
                 
                 if row is not None and not row['is_deleted'] and row['size'] == size and abs(row['mtime'] - mtime) < 1e-3:
                     sha256 = row['sha256']
@@ -401,13 +556,34 @@ def index_existing_files(files_dir: Path) -> int:
                     continue
 
             # File is new, deleted, or mtime/size changed: read and calculate hash
-            sha256 = hashlib.sha256(p.read_bytes()).hexdigest()
+            if size > 65536:
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    while chunk := f.read(65536):
+                        h.update(chunk)
+                sha256 = h.hexdigest()
+            else:
+                sha256 = hashlib.sha256(p.read_bytes()).hexdigest()
             
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    try:
+                        st_now = p.stat()
+                    except OSError:
+                        conn.execute("ROLLBACK")
+                        continue
+                    if st_now.st_size != size or abs(st_now.st_mtime - mtime) > 1e-6:
+                        conn.execute("ROLLBACK")
+                        continue
+
                     cursor = conn.execute("SELECT sha256, is_deleted, revision FROM files WHERE workspace_id = ? AND path = ?", (workspace_id, rel_path))
                     row = cursor.fetchone()
+                    cur_rev = row['revision'] if row is not None else None
+                    cur_deleted = bool(row['is_deleted']) if row is not None else None
+                    if (cur_rev, cur_deleted) != (pre_rev, pre_deleted):
+                        conn.execute("ROLLBACK")
+                        continue
                     
                     if row is not None and not row['is_deleted'] and row['sha256'] == sha256:
                         # Content is unchanged (e.g. touched mtime) - just update metadata without bumping revision

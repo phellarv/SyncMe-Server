@@ -6,5 +6,4 @@ pydantic-settings
 httpx
 pytest
 pytest-asyncio
-python-multipart
 pyyaml

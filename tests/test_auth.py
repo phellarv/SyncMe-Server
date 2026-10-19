@@ -86,12 +86,21 @@ async def test_empty_keystore_fails_closed(client):
 
 
 @pytest.mark.asyncio
-async def test_failed_auth_logs_source_ip_but_no_token(client, caplog):
+async def test_failed_auth_logs_source_ip_but_no_token(client, caplog, monkeypatch):
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", True)
     with caplog.at_level("WARNING", logger="syncme.auth"):
         await client.get(STATE, headers={"Authorization": WRONG, "X-Forwarded-For": "203.0.113.9, 10.0.0.1"})
     assert "203.0.113.9" in caplog.text
     assert "10.0.0.1" not in caplog.text            # only the first entry counts
     assert "wrong-wrong" not in caplog.text and KEY not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_forwarded_for_ignored_when_not_trusted(client, caplog):
+    with caplog.at_level("WARNING", logger="syncme.auth"):
+        await client.get(STATE, headers={"Authorization": WRONG, "X-Forwarded-For": "203.0.113.9"})
+    assert "203.0.113.9" not in caplog.text
+    assert "127.0.0.1" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -103,7 +112,8 @@ async def test_failed_auth_without_forwarded_header_logs_peer_address(client, ca
 
 
 @pytest.mark.asyncio
-async def test_forwarded_for_with_newline_cannot_forge_log_lines(client, caplog):
+async def test_forwarded_for_with_newline_cannot_forge_log_lines(client, caplog, monkeypatch):
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", True)
     with caplog.at_level("WARNING", logger="syncme.auth"):
         await client.get(STATE, headers={"X-Forwarded-For": "1.2.3.4\nINFO fake line"})
     assert "authentication failed" in caplog.text    # the request really was logged
@@ -111,7 +121,8 @@ async def test_forwarded_for_with_newline_cannot_forge_log_lines(client, caplog)
 
 
 @pytest.mark.asyncio
-async def test_forwarded_for_is_truncated_in_the_log(client, caplog):
+async def test_forwarded_for_is_truncated_in_the_log(client, caplog, monkeypatch):
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", True)
     with caplog.at_level("WARNING", logger="syncme.auth"):
         await client.get(STATE, headers={"X-Forwarded-For": "a" * 200})
     assert "a" * 64 in caplog.text and "a" * 65 not in caplog.text

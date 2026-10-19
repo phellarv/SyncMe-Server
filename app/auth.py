@@ -3,6 +3,7 @@ import logging
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .config import settings
 from .keys import keystore
 
 log = logging.getLogger("syncme.auth")
@@ -10,8 +11,11 @@ security = HTTPBearer(auto_error=False)
 
 
 def _source_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    return (forwarded or (request.client.host if request.client else "-"))[:64]
+    if settings.TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded[:64]
+    return (request.client.host if request.client else "-")[:64]
 
 
 def verify_token(

@@ -161,3 +161,16 @@ async def test_an_absurdly_long_content_length_is_413_not_a_500(raw_asgi, digits
         chunks=[b"{}"],
     )
     assert status == 413
+
+
+@pytest.mark.asyncio
+async def test_restore_archive_records_client_name(client):
+    from app import db
+    name = await archived_name(client)
+    r = await client.post(RESTORE, json={"archive_filename": name, "target_path": "a.txt"}, headers=H)
+    assert r.status_code == 200
+    rev = r.json()["revision"]
+    version = db.get_file_version("ws1", "a.txt", rev)
+    assert version is not None
+    assert version["client_name"] == "testclient"
+

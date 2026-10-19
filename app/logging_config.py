@@ -1,5 +1,7 @@
+import json
 import logging
 import logging.config
+from pathlib import Path
 import re
 from typing import Any, Dict
 from urllib.parse import unquote_plus
@@ -36,45 +38,17 @@ class RedactQueryTokensFilter(logging.Filter):
             record.args = {k: redact_query(v) if isinstance(v, str) else v for k, v in record.args.items()}
         return True
 
-LOGGING_CONFIG: Dict[str, Any] = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "default": {
-            "()": "uvicorn.logging.DefaultFormatter",
-            "fmt": "%(asctime)s - %(levelprefix)s %(message)s",
-            "datefmt": DEFAULT_DATE_FORMAT,
-            "use_colors": None,
-        },
-        "access": {
-            "()": "uvicorn.logging.AccessFormatter",
-            "fmt": '%(asctime)s - %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
-            "datefmt": DEFAULT_DATE_FORMAT,
-        },
-    },
-    "filters": {
-        "redact_query_tokens": {"()": "app.logging_config.RedactQueryTokensFilter"},
-    },
-    "handlers": {
-        "default": {
-            "formatter": "default",
-            "class": "logging.StreamHandler",
-            "stream": "ext://sys.stderr",
-        },
-        "access": {
-            "formatter": "access",
-            "class": "logging.StreamHandler",
-            "stream": "ext://sys.stdout",
-            "filters": ["redact_query_tokens"],
-        },
-    },
-    "loggers": {
-        "": {"handlers": ["default"], "level": "INFO"},
-        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
-    },
-}
+
+LOG_CONFIG_PATH = Path(__file__).resolve().parent.parent / "log_config.json"
+
+
+def load_logging_config() -> Dict[str, Any]:
+    """Load logging configuration from the central log_config.json file."""
+    with open(LOG_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+LOGGING_CONFIG: Dict[str, Any] = load_logging_config()
 
 
 def configure_logging() -> None:
