@@ -23,6 +23,30 @@ def get_conn() -> sqlite3.Connection:
         init_db(_local.conn)
     return _local.conn
 
+def lock_server_state(exclusive: bool) -> int:
+    """Lock `<db>.lock`: shared while the server runs, exclusive during a restore. Returns the fd to close.
+
+    Raises BlockingIOError when the other side holds it. flock works across containers sharing the bind mount.
+    """
+    import fcntl
+    import os
+
+    p = get_db_path()
+    fd = os.open(p.with_name(p.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+def close_conn() -> None:
+    """Close this thread's cached connection, so the next get_conn() opens the database file afresh."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        conn.close()
+        del _local.conn
+
 def init_db(conn: sqlite3.Connection):
     with conn:
         conn.execute("""
@@ -436,16 +460,42 @@ def prune_old_versions(keep_versions: int = 10) -> int:
         return cur.rowcount
 
 
+def prune_versions_older_than(cutoff: float) -> int:
+    """Delete history recorded before `cutoff`, except what is needed to restore any state since then.
+
+    Kept per file: every version recorded at or after the cutoff, the newest version before it (the state at
+    the cutoff), and the current version.
+    """
+    conn = get_conn()
+    with conn:
+        cur = conn.execute("""
+            DELETE FROM file_versions
+            WHERE created_at < ?
+              AND (workspace_id, path, revision) NOT IN (
+                  SELECT workspace_id, path, MAX(revision) FROM file_versions
+                  WHERE created_at < ? GROUP BY workspace_id, path
+              )
+              AND (workspace_id, path, revision) NOT IN (
+                  SELECT workspace_id, path, revision FROM files
+              )
+        """, (cutoff, cutoff))
+        return cur.rowcount
+
+
+# Every CAS object the database still needs; shared with the backup, which runs it against a snapshot.
+REFERENCED_CAS_SQL = """
+    SELECT workspace_id, sha256 FROM files WHERE sha256 IS NOT NULL AND sha256 != '' AND is_deleted = 0
+    UNION
+    SELECT workspace_id, sha256 FROM file_versions WHERE sha256 IS NOT NULL AND sha256 != ''
+"""
+
+
 def get_referenced_cas_hashes() -> set[tuple[str, str]]:
     conn = get_conn()
     with conn:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute("""
-            SELECT workspace_id, sha256 FROM files WHERE sha256 IS NOT NULL AND sha256 != '' AND is_deleted = 0
-            UNION
-            SELECT workspace_id, sha256 FROM file_versions WHERE sha256 IS NOT NULL AND sha256 != ''
-        """)
+        cursor = conn.execute(REFERENCED_CAS_SQL)
         return {(row[0], row[1]) for row in cursor.fetchall()}
 
 

@@ -104,7 +104,7 @@ def test_dockerfile_copies_only_what_runs():
     assert "COPY --from=build /app/.venv /app/.venv" in copies
 
 
-@pytest.mark.parametrize("service", ["server", "keys"])
+@pytest.mark.parametrize("service", ["server", "keys", "backup"])
 def test_compose_service_is_hardened(service):
     svc = _compose()["services"][service]
     assert svc["cap_drop"] == ["ALL"]
@@ -158,3 +158,58 @@ def test_readme_path_limits_match_the_code():
     readme = (PROJECT_ROOT / "README.md").read_text()
     assert f"each component at most {MAX_COMPONENT_BYTES} UTF-8 bytes" in readme
     assert f"the whole path at most {MAX_PATH_BYTES} bytes" in readme
+
+
+def test_backup_tool_service_is_opt_in_and_mounts_what_backup_and_restore_need():
+    svc = _compose()["services"]["backup"]
+    assert svc["profiles"] == ["tools"]
+    assert svc["entrypoint"] == ["python", "-m", "app.cli"]
+    # restore writes data, storage and (with --include-keys) the key file; restored files must belong to the server
+    assert svc["user"] == "${SERVER_UID:-1000}:${SERVER_GID:-1000}"
+    assert set(svc["volumes"]) == {
+        "${DATA_DIR:-./data}:/data",
+        "${STORAGE_DIR:-./storage}:/storage",
+        "${KEYS_DIR:-./keys}:/keys",
+        "${BACKUP_DIR:-./backups}:/backups",
+    }
+    env = svc["environment"]
+    for line in ("DATA_DIR=/data", "STORAGE_DIR=/storage", "SYNCME_KEYS_FILE=/keys/keys.toml", "BACKUP_DIR=/backups",
+                 "BACKUP_KEEP=${BACKUP_KEEP:-0}"):
+        assert line in env
+    assert svc["env_file"] == [".env"]     # the same path overrides (ARCHIVE_DIR, DB_PATH) as the server
+
+
+def test_backups_stay_out_of_git_and_the_image():
+    assert "backups/" in (PROJECT_ROOT / ".gitignore").read_text().splitlines()
+    assert "backups/" in (PROJECT_ROOT / ".dockerignore").read_text().splitlines()
+
+
+def test_env_example_documents_the_backup_settings():
+    text = (PROJECT_ROOT / ".env.example").read_text()
+    assert "BACKUP_DIR" in text and "BACKUP_KEEP=7" in text
+
+
+def test_systemd_units_run_the_backup_tool_service():
+    service = (PROJECT_ROOT / "systemd" / "syncme-backup.service").read_text()
+    timer = (PROJECT_ROOT / "systemd" / "syncme-backup.timer").read_text()
+    assert "Type=oneshot" in service
+    assert "compose run --build --rm backup backup" in service
+    assert "OnCalendar=" in timer and "Persistent=true" in timer
+    assert "Unit=syncme-backup.service" in timer
+
+
+def test_readme_documents_backup_and_restore():
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    for needle in ("docker compose run --rm backup backup", "docker compose run --rm backup restore",
+                   "--include-keys", "--force", "syncme-client init", "BACKUP_KEEP", ".pre-restore-",
+                   "verify-backup"):
+        assert needle in readme
+
+
+def test_docs_say_how_to_rebuild_the_tool_images_after_an_update():
+    # `docker compose build` and `up --build` skip services in an inactive profile, and `run` reuses an
+    # existing image: without this step the keys/cli/backup tools keep running the old code.
+    for doc in ("README.md", "TLDR.md"):
+        assert "docker compose --profile tools build" in (PROJECT_ROOT / doc).read_text()
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    assert "run --build --rm backup prune --keep-days 14 --archive-days 14" in readme      # the cron line

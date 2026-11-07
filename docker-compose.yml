@@ -57,3 +57,27 @@ services:
       - STORAGE_DIR=/storage
       - SYNCME_KEYS_FILE=/keys/keys.toml
 
+
+  backup:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "app.cli"]
+    # restore writes data, storage and (with --include-keys) the key file; restored files must belong to the server
+    user: "${SERVER_UID:-1000}:${SERVER_GID:-1000}"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${STORAGE_DIR:-./storage}:/storage
+      - ${KEYS_DIR:-./keys}:/keys
+      - ${BACKUP_DIR:-./backups}:/backups
+    # the same .env as the server, so ARCHIVE_DIR/DB_PATH overrides point at the same files; environment wins
+    env_file: [ .env ]
+    environment:
+      - DATA_DIR=/data
+      - STORAGE_DIR=/storage
+      - SYNCME_KEYS_FILE=/keys/keys.toml
+      - BACKUP_DIR=/backups
+      - BACKUP_KEEP=${BACKUP_KEEP:-0}

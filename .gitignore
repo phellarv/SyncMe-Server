@@ -14,5 +14,8 @@ data/
 !.env.example
 
 
-# Per-client key files (see README, "Client keys")
+# Per-client key files (see the SyncMe user guide, docs/operations.md, "Client keys")
 keys/
+
+# Backup archives (see README, "Backup & Restore")
+backups/

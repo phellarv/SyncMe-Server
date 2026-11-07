@@ -17,11 +17,14 @@ class Settings(BaseSettings):
     PORT: int = 8000
     MAX_UPLOAD_BYTES: int = 256 * 1024 * 1024
     TRUST_PROXY_HEADERS: bool = False
+    BACKUP_DIR: Path | None = None
+    BACKUP_KEEP: int = 0   # backups kept by `cli backup`; 0 keeps all
 
     model_config = SettingsConfigDict(
         env_file=(PROJECT_ROOT / ".env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,   # `NAME=` in .env means unset, not "" (an empty path would be the cwd)
     )
 
 

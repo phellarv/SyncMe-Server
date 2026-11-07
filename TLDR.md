@@ -18,6 +18,10 @@ docker compose run --rm keys add laptop
 
 # Start the server daemon
 docker compose up -d --build
+
+# After a `git pull`: rebuild all images, including the keys/cli/backup tools (the `tools` profile)
+docker compose --profile tools build
+docker compose up -d server
 ```
 Default URL: `http://localhost:8000`
 
@@ -184,3 +188,26 @@ docker compose run --rm cli client status laptop
 ```
 
 *(Without Docker Compose, run: `python -m app.cli clients`, `python -m app.cli status`, or `python -m app.cli client status <name>`)*
+
+---
+
+## 7. Backup & Restore
+
+```bash
+# Consistent backup while the server runs (into BACKUP_DIR; BACKUP_KEEP / --keep N prunes old archives):
+docker compose run --rm backup backup
+docker compose run --rm backup verify-backup /backups/<archive>.tar.gz
+
+# Restore (server stopped; existing data is moved aside to .pre-restore-<time>/):
+docker compose stop server
+docker compose run --rm backup restore /backups/<archive>.tar.gz --force
+docker compose start server
+# then run `syncme-client init` on each client
+```
+
+```bash
+# Drop file history older than 14 days (any state of the last 14 days stays restorable) and old deleted files:
+docker compose run --rm backup prune --keep-days 14 --archive-days 14
+```
+
+`--include-keys` adds or restores `keys.toml` (plain-text tokens). Nightly prune + backup: `systemd/syncme-backup.timer`. See README, "Backup & Restore".

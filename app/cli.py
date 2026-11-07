@@ -229,20 +229,81 @@ def cmd_client_status(client_name: str) -> int:
     return 0
 
 
-def cmd_prune(keep_versions: int = 10, archive_days: float | None = None) -> int:
+def cmd_prune(keep_versions: int = 10, archive_days: float | None = None, keep_days: float | None = None) -> int:
     if keep_versions < 1:
         print("error: --keep-versions must be at least 1", file=sys.stderr)
+        return 1
+    if keep_days is not None and keep_days < 0:
+        print("error: --keep-days must be non-negative", file=sys.stderr)
         return 1
     if archive_days is not None and archive_days < 0:
         print("error: --archive-days must be non-negative", file=sys.stderr)
         return 1
     from . import storage
     try:
-        stats = storage.prune_storage(keep_versions=keep_versions, archive_days=archive_days)
+        stats = storage.prune_storage(keep_versions=keep_versions, archive_days=archive_days, keep_days=keep_days)
     except OSError as e:
         print(f"error: failed to prune storage: {e}", file=sys.stderr)
         return 1
     print(f"Pruned {stats['versions_deleted']} old version record(s), {stats['cas_deleted']} unreferenced CAS object(s), {stats['archive_deleted']} archive file(s).")
+    return 0
+
+
+def cmd_backup(dest: str | None, keep: int | None, include_keys: bool) -> int:
+    from . import backup
+    from .config import settings
+
+    dest_dir = Path(dest) if dest else settings.BACKUP_DIR
+    if dest_dir is None:
+        print("error: no backup destination: pass --dest or set BACKUP_DIR", file=sys.stderr)
+        return 1
+    try:
+        archive = backup.create_backup(dest_dir, include_keys=include_keys,
+                                       keep=settings.BACKUP_KEEP if keep is None else keep)
+    except (backup.BackupError, ValueError, OSError) as e:
+        print(f"error: backup failed: {e}", file=sys.stderr)
+        return 1
+    print(f"Backup written to {archive}")
+    if include_keys:
+        print("warning: the archive contains keys.toml with the client tokens in plain text; store it safely")
+    return 0
+
+
+def cmd_verify_backup(archive: str) -> int:
+    from . import backup
+
+    try:
+        manifest = backup.verify_backup(Path(archive))
+    except backup.BackupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    revisions = ", ".join(f"{ws}@{rev}" for ws, rev in sorted(manifest["workspaces"].items())) or "no workspaces"
+    print(f"OK: backup from {manifest['created_at']} ({revisions}; keys included: {manifest['include_keys']})")
+    return 0
+
+
+def cmd_restore(archive: str, force: bool, include_keys: bool) -> int:
+    from . import backup
+
+    try:
+        result = backup.restore_backup(Path(archive), force=force, include_keys=include_keys)
+    except (backup.BackupError, OSError) as e:
+        print(f"error: restore failed: {e}", file=sys.stderr)
+        return 1
+    print(f"Restored backup from {result['manifest']['created_at']}.")
+    for ws, r in result["workspaces"].items():
+        live = (f"no live revision counter, jumped {backup.REVISION_GAP} ahead" if r["live"] is None
+                else f"live was at {r['live']}")
+        print(f"  {ws}: backup revision {r['backup'] if r['backup'] is not None else '-'}, {live}, "
+              f"next revision {r['next']}")
+    if result["repaired_files"]:
+        print(f"  {result['repaired_files']} workspace file(s) differed from the database snapshot and were "
+              "rewritten from their stored version")
+    for path in result["moved_aside"]:
+        print(f"  previous data moved aside: {path}")
+    print("Changes clients made after the backup exist only on those clients now. Once the server is running "
+          "again, run `syncme-client init` on each client (`--conflict-strategy local` pushes the client's copy, "
+          "`both` keeps both versions).")
     return 0
 
 
@@ -259,8 +320,27 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("name", help="Name of client")
 
     prune_parser = sub.add_parser("prune", help="Prune old file versions, unreferenced CAS objects, and expired archives")
-    prune_parser.add_argument("--keep-versions", type=int, default=10, help="Number of file versions to keep per file (default: 10)")
+    history = prune_parser.add_mutually_exclusive_group()
+    history.add_argument("--keep-versions", type=int, default=10, help="Number of file versions to keep per file (default: 10)")
+    history.add_argument("--keep-days", type=float, default=None,
+                         help="Instead of a count: keep every version of the last N days, plus the state N days ago")
     prune_parser.add_argument("--archive-days", type=float, default=None, help="Delete archive files older than N days")
+
+    backup_parser = sub.add_parser("backup", help="Write a consistent backup archive; safe while the server runs")
+    backup_parser.add_argument("--dest", default=None, help="Directory for the archive (default: BACKUP_DIR)")
+    backup_parser.add_argument("--keep", type=int, default=None,
+                               help="Keep only the newest N backups in the directory, 0 keeps all (default: BACKUP_KEEP)")
+    backup_parser.add_argument("--include-keys", action="store_true",
+                               help="Also back up keys.toml (contains the client tokens in plain text)")
+
+    verify_parser = sub.add_parser("verify-backup", help="Check a backup archive without restoring it")
+    verify_parser.add_argument("archive")
+
+    restore_parser = sub.add_parser("restore", help="Restore a backup archive; the server must be stopped")
+    restore_parser.add_argument("archive")
+    restore_parser.add_argument("--force", action="store_true",
+                                help="Restore over existing data, which is moved aside to .pre-restore-<time>/")
+    restore_parser.add_argument("--include-keys", action="store_true", help="Also restore keys.toml from the backup")
 
     args = parser.parse_args(argv)
     if args.cmd == "clients":
@@ -271,7 +351,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.client_cmd == "status":
             return cmd_client_status(args.name)
     elif args.cmd == "prune":
-        return cmd_prune(keep_versions=args.keep_versions, archive_days=args.archive_days)
+        return cmd_prune(keep_versions=args.keep_versions, archive_days=args.archive_days, keep_days=args.keep_days)
+    elif args.cmd == "backup":
+        return cmd_backup(args.dest, args.keep, args.include_keys)
+    elif args.cmd == "verify-backup":
+        return cmd_verify_backup(args.archive)
+    elif args.cmd == "restore":
+        return cmd_restore(args.archive, args.force, args.include_keys)
     return 0
 
 

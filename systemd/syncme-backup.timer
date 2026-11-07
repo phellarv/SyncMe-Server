@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the SyncMe-Server backup every night
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+# a run missed while the machine was off happens at the next boot
+Persistent=true
+Unit=syncme-backup.service
+
+[Install]
+WantedBy=timers.target

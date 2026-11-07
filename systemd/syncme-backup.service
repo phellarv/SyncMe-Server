@@ -1,0 +1,17 @@
+# Nightly SyncMe-Server backup; see README, "Backup & Restore".
+# Adjust WorkingDirectory to the directory that holds docker-compose.yml and .env, then:
+#   sudo cp systemd/syncme-backup.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now syncme-backup.timer
+[Unit]
+Description=SyncMe-Server backup
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/SyncMe-Server
+# Prune first, never at the same time as the backup (a prune during a backup makes it fail). History of the
+# last 14 days stays restorable, plus deleted files for 14 days. "-": a failed prune does not skip the backup.
+# --build: `run` reuses an existing image, so after a `git pull` the tool image would still run old code.
+ExecStartPre=-/usr/bin/docker compose run --build --rm backup prune --keep-days 14 --archive-days 14
+ExecStart=/usr/bin/docker compose run --build --rm backup backup

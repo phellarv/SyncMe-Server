@@ -267,9 +267,12 @@ def sweep_stale_temp_files(max_age: float = STALE_TEMP_SECONDS) -> int:
     return removed
 
 
-def prune_storage(keep_versions: int = 10, archive_days: float | None = None) -> dict:
+def prune_storage(keep_versions: int = 10, archive_days: float | None = None, keep_days: float | None = None) -> dict:
+    """Prune file history by count (`keep_versions` per file) or, when `keep_days` is set, by age instead."""
     if keep_versions < 1:
         raise ValueError("keep_versions must be >= 1")
+    if keep_days is not None and keep_days < 0:
+        raise ValueError("keep_days must be >= 0")
     if archive_days is not None and archive_days < 0:
         raise ValueError("archive_days must be >= 0")
 
@@ -287,7 +290,10 @@ def prune_storage(keep_versions: int = 10, archive_days: float | None = None) ->
         or conn.execute("SELECT 1 FROM file_versions LIMIT 1").fetchone() is not None
     )
 
-    versions_deleted = db.prune_old_versions(keep_versions=keep_versions)
+    if keep_days is not None:
+        versions_deleted = db.prune_versions_older_than(time.time() - keep_days * 86400.0)
+    else:
+        versions_deleted = db.prune_old_versions(keep_versions=keep_versions)
 
     cas_deleted = 0
     if db_has_data and cas_base.exists():

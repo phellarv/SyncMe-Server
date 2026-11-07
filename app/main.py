@@ -1,4 +1,5 @@
 import asyncio
+import os
 import hashlib
 import logging
 import time
@@ -25,6 +26,10 @@ log = logging.getLogger("syncme.health")
 async def lifespan(app: FastAPI):
     configure_logging()
     keystore.load()   # fail closed: a missing or invalid key file stops the server
+    try:
+        state_lock = db.lock_server_state(exclusive=False)   # `cli restore` refuses to run while this is held
+    except BlockingIOError:
+        raise RuntimeError("a restore of the server state is in progress; start the server when it has finished") from None
     storage.sweep_stale_temp_files()   # orphans of a crashed upload; before indexing, which skips them anyway
     db.prune_stale_sse_connections()
     # Startup: index existing files in storage dir in background so server starts immediately
@@ -33,8 +38,11 @@ async def lifespan(app: FastAPI):
         if not t.cancelled() and t.exception():
             logging.getLogger("syncme.index").error("Startup indexing failed: %s", t.exception(), exc_info=t.exception())
     index_task.add_done_callback(_on_index_done)
-    yield
-    await index_task
+    try:
+        yield
+        await index_task
+    finally:
+        os.close(state_lock)
 
 # An event stream is authenticated when it connects; it is re-checked this often (seconds) and whenever
 # an event is due, and ends when its key no longer maps to the same client. Read at call time.
